@@ -1,0 +1,134 @@
+/*
+ * IBM Confidential
+ *
+ * Licensed Materials - Property of IBM
+ * (C) Copyright IBM Corp. 2019  All Rights Reserved
+ * US Government Users Restricted Rights - Use, duplication or
+ * disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+ */
+package com.ibm.cedp.garage.common.ingestion.repositories
+
+import java.sql.{Connection, DriverManager}
+import java.util.Properties
+
+import com.ibm.cedp.garage.common.ingestion.util.{Db2WoCDialect, Util}
+import com.ibm.cedp.garage.common.ingestion.Spark
+import org.apache.log4j.Logger
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
+import org.apache.spark.sql.jdbc.JdbcDialects
+import org.apache.spark.sql.{DataFrame, SaveMode}
+
+class JdbcConnection(conf: Map[String, String]) extends AutoCloseable {
+  private val logger = Logger.getLogger(getClass)
+  private val JDBC_DRIVER_CLASS = "driver"
+  private val JDBC_URL = "url"
+  private val JDBC_USER = "user"
+  private val JDBC_PASSWORD = "password"
+  private val driver = conf.getOrElse(JDBC_DRIVER_CLASS, "com.ibm.db2.jcc.DB2Driver")
+  private val url = conf(JDBC_URL)
+  //getOrElse null because DriverManager.getConnection has built-in null check
+  private val user = conf.getOrElse(JDBC_USER, null)
+  private val password = conf.getOrElse(JDBC_PASSWORD, null)
+
+  //seems like needed only for db2jcc.jar, not db2jcc4.jar - need check
+  Class.forName(driver)
+  //lazy need for unit tests
+  private lazy val connection: Connection = DriverManager.getConnection(url, user, password)
+  private val lineSeparator = sys.props("line.separator")
+
+  //register custom dialect for Db2WoC
+  JdbcDialects.registerDialect(Db2WoCDialect)
+
+  def readJdbc(query: String,
+               partitionColumn: Option[String] = None,
+               lowerBound: Option[Long] = None,
+               upperBound: Option[Long] = None,
+               numPartitions: Option[Int] = None): DataFrame = {
+    val properties = new Properties()
+    properties.setProperty(JDBC_DRIVER_CLASS, driver)
+    if (user != null) properties.setProperty(JDBC_USER, user)
+    if (password != null) properties.setProperty(JDBC_PASSWORD, password)
+    properties.setProperty(JDBCOptions.JDBC_BATCH_FETCH_SIZE,
+                           conf.getOrElse(JDBCOptions.JDBC_BATCH_FETCH_SIZE, "10000").toString)
+    properties.setProperty(JDBCOptions.JDBC_TXN_ISOLATION_LEVEL,
+                           conf.getOrElse(JDBCOptions.JDBC_TXN_ISOLATION_LEVEL, "READ_COMMITTED").toString)
+
+    logger.info(s"Executing query: $query")
+	System.out.println(s "Executing query: $query) 
+    if (partitionColumn.isDefined && lowerBound.isDefined && upperBound.isDefined) {
+      Spark.sparkSession.read.jdbc(url,
+                                   query,
+                                   partitionColumn.get,
+                                   lowerBound.get,
+                                   upperBound.get,
+                                   numPartitions.get,
+                                   properties)
+    } else {
+      Spark.sparkSession.read.jdbc(url, query, properties)
+    }
+  }
+
+  def writeJdbc(table: String, df: DataFrame, numPartitions: Int, saveMode: SaveMode = SaveMode.Append): Unit = {
+    val start = System.currentTimeMillis()
+    val properties = new Properties()
+    properties.setProperty(JDBCOptions.JDBC_DRIVER_CLASS, driver)
+    if (user != null) properties.setProperty(JDBC_USER, user)
+    if (password != null) properties.setProperty(JDBC_PASSWORD, password)
+    properties.setProperty(JDBCOptions.JDBC_NUM_PARTITIONS, numPartitions.toString)
+    properties.setProperty(JDBCOptions.JDBC_BATCH_INSERT_SIZE,
+                           conf.getOrElse(JDBCOptions.JDBC_BATCH_INSERT_SIZE, "10000").toString)
+    properties.setProperty(JDBCOptions.JDBC_TRUNCATE, conf.getOrElse(JDBCOptions.JDBC_TRUNCATE, false).toString)
+
+    df.write.mode(saveMode).jdbc(url, table, properties)
+    logger.info(s"Writing data to the $table table finished and took ${Util.getDuration(start)}")
+  }
+
+  def getCount(table: String, whereCondition: Option[String], limit: Option[Long] = None): Long = {
+    val limitQuery = limit.map(l => s" FETCH FIRST $l ROWS ONLY").getOrElse("")
+    val whereQuery = whereCondition.map(w => s" WHERE $w").getOrElse("")
+    getCount(s"SELECT * FROM $table" + whereQuery + limitQuery)
+  }
+
+  def getCount(query: String): Long = {
+    val isolationLevel = if (url.startsWith("jdbc:db2:")) " WITH UR FOR READ ONLY" else ""
+    val countQuery = s"SELECT count(*) FROM ($query) AS CNTTMP" + isolationLevel
+    logger.info(s"Executing query: $lineSeparator$countQuery")
+
+    Util.autoClose(connection.createStatement()) { stmt =>
+      val rs = stmt.executeQuery(countQuery)
+      if (rs.next()) {
+        rs.getLong(1)
+      } else {
+        -1
+      }
+    }
+  }
+
+  def executeUpdate(query: String): Unit = {
+    logger.info(s"Executing query: $lineSeparator$query")
+    Util.autoClose(connection.createStatement()) { stmt =>
+      stmt.executeUpdate(query)
+    }
+  }
+
+  def executeBatch(queries: String*): Unit = {
+    logger.info(s"Executing queries: $lineSeparator${queries.mkString(lineSeparator)}")
+    connection.setAutoCommit(false)
+    Util.autoClose(connection.createStatement()) { stmt =>
+      queries.foreach(stmt.addBatch)
+      stmt.executeBatch
+      connection.commit()
+    }
+    connection.setAutoCommit(true)
+  }
+
+  def tableExists(table: String): Boolean = {
+    val schemaName = table.split("\\.").head
+    val tableName = table.split("\\.").last
+    connection.getMetaData.getTables(null, schemaName, tableName, Array("TABLE", "ALIAS")).next
+  }
+
+  override def close(): Unit = {
+    connection.close()
+  }
+}
